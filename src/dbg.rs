@@ -154,9 +154,33 @@ impl ZDbg<NotRunning> {
 
 /// Running の実装
 impl ZDbg<Running> {
-    // 機械語レベルでステップ実行を行う
-    fn do_stepi(self) -> Result<State, DynError> {
-        // TODO: 
+    // // 機械語レベルでステップ実行を行う
+    // fn do_stepi(self) -> Result<State, DynError> {
+    //     // TODO:
+    // }
+
+    pub fn do_cmd(mut self, cmd: &[&str]) -> Result<State, DynError> {
+        if cmd.is_empty() {
+            return Ok(State::Running(self));
+        }
+
+        match cmd[0] {
+            "break" | "b" => self.do_break(cmd)?,
+            "continue" | "c" => return self.do_continue(),
+            // "register" | "regs" => {
+            //     let regs = ptrace::getregs(self.info.pid)?;
+            //     print_regs(&regs);
+            // }
+            "run" | "r" => eprintln!("<<ターゲットは既に実行中です>>"),
+            "exit" => {
+                self.do_exit()?;
+                return Ok(State::Exit);
+            }
+            _ => self.do_cmd_common(cmd),
+        }
+
+
+        Ok(State::Running(self))
     }
 
     fn do_exit(self) -> Result<(), DynError> {
@@ -178,14 +202,16 @@ impl ZDbg<Running> {
     }
 
     fn set_break(&mut self) -> Result<(), DynError> {
-        let addr = if leet Some(addr) = self.info.brk_addr {
+        let addr = if let Some(addr) = self.info.brk_addr {
+            // ブレークポイントが設定されている場合はそのアドレスを取得
             addr
         } else {
             return Ok(());
-        }
+        };
 
         // ブレークするアドレスにあるメモリ上の位置を取得
-        if val = match ptrace::read(self.info.pid, addr) {
+        // 8バイト単位で取得ｄけいる
+        let val = match ptrace::read(self.info.pid, addr) {
             Ok(val) => val,
             Err(e) => {
                 eprintln!("<<ブレークポイントの設定に失敗: {e}, addr = {:p}>>", addr);
@@ -194,7 +220,7 @@ impl ZDbg<Running> {
         };
 
         // メモリ上の値を表示する補助関数
-        fn print_val(afddr: usize, val: i64) {
+        fn print_val(addr: usize, val: i64) {
             print!("{:x}", addr);
             for n in (0..8).map(|n| ((val >> (n*8)) & 0xff) as u8) {
                 print!(" {:02x}", n);
@@ -203,13 +229,103 @@ impl ZDbg<Running> {
 
         println!("<<以下のようにメモリを書き換えます>>");
         println!("<<before: "); // 元の値
-        print_val(addr as usize, val);
+        print_val(addr as usize, val as i64);
         println!(">>");
 
+        // まず下位8ビットを0クリアして、 0xcc を書き込む
+        // x86_64 では リトルエンディアン採用
+        // ビッグエンディアンは多くのインターネットプロトコルで採用されるため「ネットワークバイトオーダー」と呼ばれる
         let val_int3 = (val & !0xff) | 0xcc; // 0xcc は INT3 命令
-        // 続き
+        print!("<<after: "); // 書き換え後の値
+        print_val(addr as usize, val_int3 as i64);
+        println!(">>");
+
+        // "int 3" をメモリに書き込み
+        match unsafe {
+            ptrace::write(self.info.pid, addr, val_int3 as *mut c_void)
+        } {
+            Ok(_) => {
+                self.info.brk_addr = Some(addr);
+                self.info.brk_val = val; // 元の値を保存
+            }
+            Err(e) => {
+                eprintln!("<<ブレークポイントの設定に失敗: {e}, addr = {:p}>>", addr);
+            }
+        }
 
         Ok(())
+    }
+
+    fn do_continue(self) -> Result<State, DynError> {
+        // ブレークポイントで停止している場合は1ステップ実行後再開
+        // step_and_break や wait_child を実行すると子プロセスが終了すう可能性がある？
+        //   終わりってこと？
+        // self で値を取得して、遷移後の状態を返すようにしている？
+        //   どこのこと？なんで？
+        match self.step_and_break()? {
+            State::Running(r) => {
+                ptrace::cont(r.info.pid, None)?;
+                r.wait_child()
+            }
+            n => Ok(n),
+        }
+    }
+
+    fn step_and_break(mut self) -> Result<State, DynError> {
+        // レジスタを取得する
+        let regs = ptrace::getregs(self.info.pid)?;
+        // ブレークポイントのアドレスかチェック
+        if Some((regs.rip) as *mut c_void) == self.info.brk_addr {
+            // ブレークポイントアドレスなら1ステップ実行
+            ptrace::step(self.info.pid, None)?;
+            // 止まったら終了
+            match waitpid(self.info.pid, None)? {
+                WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
+                    println!("<<子プロセスが終了しました>>");
+                    return Ok(State::NotRunning(ZDbg::<NotRunning>{
+                        info: self.info,
+                        _state: NotRunning,
+                    }))
+                }
+                _ => (),
+            }
+        }
+
+        Ok(State::Running(self))
+    }
+
+    fn wait_child(self) -> Result<State, DynError> {
+        match waitpid(self.info.pid, None)? {
+            WaitStatus::Exited(..) | WaitStatus::Signaled(..) => {
+                println!("<<子プロセスが終了しました>>");
+                let not_run = ZDbg::<NotRunning> {
+                    info: self.info,
+                    _state: NotRunning,
+                };
+                Ok(State::NotRunning(not_run))
+            }
+            WaitStatus::Stopped(..) => {
+                let mut regs = ptrace::getregs(self.info.pid)?;
+                if Some((regs.rip - 1) as *mut c_void) == self.info.brk_addr {
+                    // 書き換えたメモリを元に戻す
+                    unsafe {
+                        ptrace::write(
+                            self.info.pid,
+                            self.info.brk_addr.unwrap(),
+                            self.info.brk_val as *mut c_void,
+                        )?
+                    };
+
+                    // ブレークポイントで停止したアドレスから1つ戻す
+                    regs.rip -= 1;
+                    ptrace::setregs(self.info.pid, regs)?;
+                }
+                println!("<<子プロセスが停止しました: PC = {:#x}>>", regs.rip);
+
+                Ok(State::Running(self))
+            }
+            _ => Err("waitpid の返り値が不正です".into()),
+        }
     }
 }
 
