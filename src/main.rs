@@ -1,6 +1,8 @@
 use std::env;
-use rustyline::Editor;
+
+use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+
 use crate::dbg::{State, ZDbg};
 use crate::helper::DynError;
 
@@ -21,7 +23,7 @@ fn main() -> Result<(), DynError> {
 fn run_dbg(filename: &str) -> Result<(), DynError> {
     let debugger = ZDbg::new(filename.to_string());
     let mut state = State::NotRunning(debugger);
-    let mut rl = Editor::new()?;
+    let mut rl = DefaultEditor::new()?;
 
     loop {
         match rl.readline("zdbg > ") {

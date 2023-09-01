@@ -1,8 +1,8 @@
 use crate::helper::DynError;
-use nix::sys::personality::{self, Persona};
 use nix::{
     libc::user_regs_struct,
     sys::{
+        personality::{self, Persona},
         ptrace,
         wait::{waitpid, WaitStatus},
     },
@@ -50,7 +50,7 @@ impl<T> ZDbg<T> {
         if self.info.brk_addr.is_some() {
             println!("ブレークポイントは設定済み: Addr = {:p}>>", self.info.brk_addr.unwrap());
             false
-        } else if Some(addr) = get_break_addr(cmd) {
+        } else if let Some(addr) = get_break_addr(cmd) {
             self.info.brk_addr = Some(addr); // ブレークポイントのアドレスを設定
             true
         } else {
@@ -342,4 +342,28 @@ fn do_help() {
         help         : このヘルプを表示 (h)
         "#
     );
+}
+
+/// コマンドからブレークポイントを計算
+fn get_break_addr(cmd: &[&str]) -> Option<*mut c_void> {
+    if cmd.len() < 2 {
+        eprintln!("<<アドレスを指定してください\n例 : break 0x8000>>");
+        return None;
+    }
+
+    let addr_str = cmd[1];
+    if &addr_str[0..2] != "0x" {
+        eprintln!("<<アドレスは16進数でのみ指定可能です\n例 : break 0x8000>>");
+        return None;
+    }
+
+    let addr = match usize::from_str_radix(&addr_str[2..], 16) {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("<<アドレス変換エラー : {}>>", e);
+            return None;
+        }
+    } as *mut c_void;
+
+    Some(addr)
 }
